@@ -25,16 +25,32 @@
   .msg{position:fixed;inset:0;display:none;place-items:center;padding:24px;text-align:center;background:#f8fafc;color:#1e293b;z-index:3}
   .msg.on{display:grid}
   .msg button{margin-top:14px;padding:10px 22px;border:0;border-radius:10px;background:#4338ca;color:#fff;font-size:15px}
+
+  /* แจ้งเตือน */
+  #pushDlg{position:fixed;inset:0;z-index:9;display:none;place-items:end center;background:rgba(15,23,42,.45);padding:16px}
+  #pushDlg.on{display:grid}
+  #pushDlg .card{width:100%;max-width:420px;background:#fff;border-radius:20px;padding:20px 18px calc(18px + env(safe-area-inset-bottom));box-shadow:0 10px 30px rgba(0,0,0,.25);color:#1e293b}
+  #pushDlg h3{margin:0 0 6px;font-size:18px}
+  #pushDlg p{margin:0 0 14px;color:#475569;font-size:14.5px;line-height:1.55}
+  #pushDlg .row{display:flex;gap:10px}
+  #pushDlg button{flex:1;padding:12px;border-radius:12px;border:1px solid #cbd5e1;background:#fff;font-size:15px;font-weight:600;color:#334155}
+  #pushDlg button.pri{background:#4338ca;border-color:#4338ca;color:#fff}
+  #pushToast{position:fixed;left:12px;right:12px;top:calc(10px + env(safe-area-inset-top));z-index:8;background:#1e1b4b;color:#fff;border-radius:14px;padding:12px 14px;box-shadow:0 8px 24px rgba(0,0,0,.3);font-size:14px;transform:translateY(-140%);transition:transform .3s}
+  #pushToast.on{transform:none}
+  #pushToast b{display:block;margin-bottom:2px}
 </style>
+<script src="push-config.js"></script>
 </head>
 <body>
 <div id="splash"><div style="text-align:center"><img src="icon-192.png" alt=""><p>ตารางเวร<small>กำลังโหลด…</small></p></div></div>
 <div id="offline" class="msg"><div><div style="font-size:40px">📶</div><b>ไม่มีอินเทอร์เน็ต</b><div style="color:#64748b;margin-top:6px">ต่ออินเทอร์เน็ตแล้วกดลองใหม่</div><button onclick="location.reload()">ลองใหม่</button></div></div>
 <div id="setup" class="msg"><div><div style="font-size:40px">⚙️</div><b>ยังไม่ได้ใส่ลิงก์ระบบ</b><div style="color:#64748b;margin-top:6px">แก้ไฟล์ index.html → ใส่ลิงก์ Web app (ลงท้าย /exec) ที่ APP_URL</div></div></div>
+<div id="pushDlg"><div class="card" id="pushCard"></div></div>
+<div id="pushToast" onclick="toastTap()"></div>
 <iframe id="app" title="ตารางเวร" allow="clipboard-write"></iframe>
 <script>
   // ▼▼▼ วางลิงก์ Web app ของ Apps Script (Deploy → Manage deployments → Web app URL ลงท้ายด้วย /exec) ▼▼▼
-  const APP_URL = 'https://script.google.com/macros/s/AKfycbxmASVX7xOie4clxrNS2XgEODIecK0FSnwHUh2ktcShxodYBpnY5zOMhQ7Na9uUELjinA/exec';
+  const APP_URL = 'https://script.google.com/macros/s/วางรหัสตรงนี้/exec';
   // ▲▲▲
 
   const $ = id => document.getElementById(id);
@@ -48,7 +64,67 @@
   }
   window.addEventListener('offline', () => $('offline').classList.add('on'));
   window.addEventListener('online', () => $('offline').classList.remove('on'));
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  const swReady = 'serviceWorker' in navigator ? navigator.serviceWorker.register('sw.js').then(() => navigator.serviceWorker.ready).catch(() => null) : Promise.resolve(null);
+
+  /* ===================== 🔔 แจ้งเตือน (Firebase Cloud Messaging) ===================== */
+  const CFG = window.FIREBASE_CONFIG, VAPID = window.VAPID_KEY || '';
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  const hasApi = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+  const supported = !!(CFG && VAPID && hasApi);
+  let appWin = null, fcmToken = null, pendingGo = new URLSearchParams(location.search).get('go') || '', justEnabled = false, msgP = null;
+  const link = location.origin + location.pathname;
+  const reply = m => { try { appWin && appWin.postMessage(m, '*'); } catch (e) {} };
+  const perm = () => ('Notification' in window) ? Notification.permission : 'unsupported';
+  const state = extra => Object.assign({ shiftPush: 'state', supported, needInstall: isIOS && !standalone, configured: !!(CFG && VAPID), perm: perm(), token: fcmToken, link, justEnabled }, extra || {});
+  const loadJs = src => new Promise((ok, no) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = no; document.head.appendChild(s); });
+  function messaging() {
+    if (!msgP) msgP = (async () => {
+      await loadJs('https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js');
+      await loadJs('https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js');
+      if (!firebase.apps.length) firebase.initializeApp(CFG);
+      const m = firebase.messaging();
+      m.onMessage(p => { const n = p.notification || {}; showToast(n.title || 'ตารางเวร', n.body || '', (p.fcmOptions && p.fcmOptions.link) || ''); reply({ shiftPush: 'refresh' }); });
+      return m;
+    })();
+    return msgP;
+  }
+  async function getTok() { const reg = await swReady; if (!reg) throw new Error('ไม่มี service worker'); const m = await messaging(); return m.getToken({ vapidKey: VAPID, serviceWorkerRegistration: reg }); }
+  window.addEventListener('message', async e => {
+    const d = e.data || {};
+    if (!d || typeof d.shiftPush !== 'string') return;
+    let host = ''; try { host = new URL(e.origin).hostname; } catch (_) {}
+    if (!/(\.googleusercontent\.com|script\.google\.com)$/.test(host)) return;
+    appWin = e.source;
+    if (d.shiftPush === 'hello') {
+      if (supported && perm() === 'granted') { try { fcmToken = await getTok(); } catch (err) { fcmToken = null; } }
+      reply(state()); justEnabled = false;
+      if (pendingGo) { reply({ shiftPush: 'go', page: pendingGo }); pendingGo = ''; history.replaceState(null, '', location.pathname); }
+    }
+    if (d.shiftPush === 'enable') openDlg();
+  });
+  // กดแจ้งเตือนตอนแอปเปิดอยู่ (จาก service worker)
+  if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('message', e => { const g = e.data && e.data.shiftGo; if (g) reply({ shiftPush: 'go', page: g }); });
+  let toastLink = '', toastT = 0;
+  function showToast(t, b, l) { const el = $('pushToast'); el.innerHTML = '<b></b><span></span>'; el.querySelector('b').textContent = '🔔 ' + t; el.querySelector('span').textContent = b; toastLink = l; el.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove('on'), 7000); }
+  function toastTap() { $('pushToast').classList.remove('on'); let g = ''; try { g = new URL(toastLink).searchParams.get('go') || ''; } catch (_) {} if (g) reply({ shiftPush: 'go', page: g }); }
+  function dlg(html) { $('pushCard').innerHTML = html; $('pushDlg').classList.add('on'); }
+  function closeDlg() { $('pushDlg').classList.remove('on'); }
+  function openDlg() {
+    if (!CFG || !VAPID) return dlg('<h3>🔔 ยังไม่พร้อม</h3><p>Admin ยังไม่ได้ตั้งค่าระบบแจ้งเตือน (ไฟล์ push-config.js)</p><div class="row"><button class="pri" onclick="closeDlg()">ตกลง</button></div>');
+    if (isIOS && !standalone) return dlg('<h3>📲 ติดตั้งแอปก่อน</h3><p>iPhone รับแจ้งเตือนได้เมื่อเปิดจาก <b>ไอคอน “ตารางเวร” บนหน้าจอหลัก</b> เท่านั้น (iOS 16.4 ขึ้นไป)<br>Safari → ปุ่มแชร์ → เพิ่มไปยังหน้าจอโฮม แล้วเปิดจากไอคอน</p><div class="row"><button class="pri" onclick="closeDlg()">เข้าใจแล้ว</button></div>');
+    if (!hasApi) return dlg('<h3>🔔 ไม่รองรับ</h3><p>เครื่องหรือเบราว์เซอร์นี้ยังไม่รองรับการแจ้งเตือน ลองเปิดด้วย Chrome (Android) หรืออัปเดต iOS</p><div class="row"><button class="pri" onclick="closeDlg()">ตกลง</button></div>');
+    if (perm() === 'denied') return dlg('<h3>🔕 การแจ้งเตือนถูกบล็อก</h3><p>เปิดได้ที่ <b>ตั้งค่ามือถือ → แอป/การแจ้งเตือน → ตารางเวร</b> (Android: Chrome → การตั้งค่าเว็บไซต์ → การแจ้งเตือน) แล้วเปิดแอปใหม่</p><div class="row"><button class="pri" onclick="closeDlg()">ตกลง</button></div>');
+    dlg('<h3>🔔 เปิดการแจ้งเตือน</h3><p>รับแจ้งเตือนเมื่อ <b>เพื่อนขอแลกเวร</b>, คำขอของคุณ<b>มีผล/ถูกปฏิเสธ</b>, Admin แก้เวร หรือ<b>ตารางเดือนใหม่เผยแพร่</b><br><span style="font-size:13px;color:#64748b">กด “อนุญาต” แล้วเลือก <b>อนุญาต / Allow</b> ในหน้าต่างของมือถือ</span></p><div class="row"><button onclick="closeDlg()">ไว้ทีหลัง</button><button class="pri" id="pushGo" onclick="doEnable()">อนุญาต</button></div>');
+  }
+  async function doEnable() {
+    const b = $('pushGo'); if (b) { b.disabled = true; b.textContent = 'กำลังเปิด…'; }
+    try {
+      const p = await Notification.requestPermission();
+      if (p !== 'granted') { closeDlg(); reply(state()); return; }
+      fcmToken = await getTok(); justEnabled = true; closeDlg(); reply(state()); justEnabled = false;
+    } catch (err) { dlg('<h3>เปิดไม่สำเร็จ</h3><p>' + String(err && err.message || err).replace(/</g, '&lt;') + '</p><div class="row"><button class="pri" onclick="closeDlg()">ตกลง</button></div>'); }
+  }
 </script>
 </body>
 </html>
